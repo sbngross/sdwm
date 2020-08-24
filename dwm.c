@@ -23,13 +23,17 @@
  * To understand everything else, start reading main().
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <X11/cursorfont.h>
@@ -61,11 +65,16 @@
 
 /* enums */
 enum { CurNormal, CurResize, CurMove, CurLast }; /* cursor */
-enum { SchemeNorm, SchemeSel }; /* color schemes */
+enum { SchemeNorm, SchemeSel, SchemePowerLow, SchemePowerMedium, SchemePowerHigh, SchemePowerCharge, SchemePowerInval }; /* color schemes */
+enum {
+	PowerThreshMedium = 50,
+	PowerThreshLow = 20
+}; /* power threshold */
 enum { NetSupported, NetWMName, NetWMState, NetWMCheck,
        NetWMFullscreen, NetActiveWindow, NetWMWindowType,
        NetWMWindowTypeDialog, NetClientList, NetLast }; /* EWMH atoms */
 enum { WMProtocols, WMDelete, WMState, WMTakeFocus, WMLast }; /* default atoms */
+enum { StDefault, StLast }; /* status atoms */
 enum { ClkTagBar, ClkLtSymbol, ClkStatusText, ClkWinTitle,
        ClkClientWin, ClkRootWin, ClkLast }; /* clicks */
 
@@ -99,6 +108,16 @@ struct Client {
 	Client *snext;
 	Monitor *mon;
 	Window win;
+};
+
+typedef struct DevStatus DevStatus;
+struct DevStatus {
+	pthread_mutex_t mtx;
+	XEvent ev;
+	Clr *scm;
+	int power;
+	int charge;
+	char text[256];
 };
 
 typedef struct {
@@ -178,6 +197,7 @@ static int gettextprop(Window w, Atom atom, char *text, unsigned int size);
 static void grabbuttons(Client *c, int focused);
 static void grabkeys(void);
 static void incnmaster(const Arg *arg);
+static void initstatushandler(void);
 static void keypress(XEvent *e);
 static void killclient(const Arg *arg);
 static void manage(Window w, XWindowAttributes *wa);
@@ -205,6 +225,9 @@ static void setfullscreen(Client *c, int fullscreen);
 static void setlayout(const Arg *arg);
 static void setmfact(const Arg *arg);
 static void setup(void);
+static int setuphandler(void);
+static void setupstatus(void);
+static int setuptimer(void);
 static void seturgent(Client *c, int urg);
 static void showhide(Client *c);
 static void sigchld(int unused);
@@ -212,6 +235,7 @@ static void spawn(const Arg *arg);
 static void tag(const Arg *arg);
 static void tagmon(const Arg *arg);
 static void tile(Monitor *);
+static void timerhandle(int sig, siginfo_t *si, void *uc);
 static void togglebar(const Arg *arg);
 static void togglefloating(const Arg *arg);
 static void toggletag(const Arg *arg);
@@ -262,7 +286,7 @@ static void (*handler[LASTEvent]) (XEvent *) = {
 	[PropertyNotify] = propertynotify,
 	[UnmapNotify] = unmapnotify
 };
-static Atom wmatom[WMLast], netatom[NetLast];
+static Atom wmatom[WMLast], netatom[NetLast], statom[StLast];
 static int running = 1;
 static Cur *cursor[CurLast];
 static Clr **scheme;
@@ -270,6 +294,13 @@ static Display *dpy;
 static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
+
+static DevStatus status;
+static timer_t timerid;
+static struct sigevent sev;
+static struct itimerspec its;
+static struct sigaction sa;
+static char readbuf[READ_BUF_SIZE];
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
@@ -518,8 +549,12 @@ clientmessage(XEvent *e)
 	XClientMessageEvent *cme = &e->xclient;
 	Client *c = wintoclient(cme->window);
 
-	if (!c)
-		return;
+	if (!c) {
+		if (cme->message_type == statom[StDefault])
+			drawbar(mons);
+		else
+			return;
+	}
 	if (cme->message_type == netatom[NetWMState]) {
 		if (cme->data.l[1] == netatom[NetWMFullscreen]
 		|| cme->data.l[2] == netatom[NetWMFullscreen])
@@ -705,10 +740,13 @@ drawbar(Monitor *m)
 	Client *c;
 
 	/* draw status first so it can be overdrawn by tags later */
-	if (m == selmon) { /* status is only drawn on selected monitor */
-		drw_setscheme(drw, scheme[SchemeNorm]);
-		tw = TEXTW(stext) - lrpad + 2; /* 2px right padding */
-		drw_text(drw, m->ww - tw, 0, tw, bh, 0, stext, 0);
+	if (m == mons && !pthread_mutex_trylock(&status.mtx)) {
+		drw_setscheme(drw, status.scm);
+
+		tw = TEXTW(status.text) - lrpad + 2; /* 2px right padding */
+		drw_text(drw, mons->ww - tw, 0, tw, bh, 0, status.text, 0);
+
+		pthread_mutex_unlock(&status.mtx);
 	}
 
 	for (c = m->clients; c; c = c->next) {
@@ -1219,7 +1257,7 @@ propertynotify(XEvent *e)
 	XPropertyEvent *ev = &e->xproperty;
 
 	if ((ev->window == root) && (ev->atom == XA_WM_NAME))
-		updatestatus();
+		return; /* ignore */
 	else if (ev->state == PropertyDelete)
 		return; /* ignore */
 	else if ((c = wintoclient(ev->window))) {
@@ -1565,6 +1603,7 @@ setup(void)
 	netatom[NetWMWindowType] = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
 	netatom[NetWMWindowTypeDialog] = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
 	netatom[NetClientList] = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
+	statom[StDefault] = XInternAtom(dpy, "_STATUS_DEFAULT", False);
 	/* init cursors */
 	cursor[CurNormal] = drw_cur_create(drw, XC_left_ptr);
 	cursor[CurResize] = drw_cur_create(drw, XC_sizing);
@@ -1574,8 +1613,8 @@ setup(void)
 	for (i = 0; i < LENGTH(colors); i++)
 		scheme[i] = drw_scm_create(drw, colors[i], 3);
 	/* init bars */
+	initstatushandler();
 	updatebars();
-	updatestatus();
 	/* supporting window for NetWMCheck */
 	wmcheckwin = XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0);
 	XChangeProperty(dpy, wmcheckwin, netatom[NetWMCheck], XA_WINDOW, 32,
@@ -1989,12 +2028,126 @@ updatesizehints(Client *c)
 	c->isfixed = (c->maxw && c->maxh && c->maxw == c->minw && c->maxh == c->minh);
 }
 
+int
+readfile(int *val, const char *filename)
+{
+	int fd;
+
+	if ((fd = open(filename, O_RDONLY))== -1)
+		return errno;
+
+	if (read(fd, readbuf, sizeof(readbuf)) == -1)
+		return errno;
+
+	*val = atoi(readbuf);
+
+	close(fd);
+
+	return 0;
+}
+
+void
+statuscolor(int power, int charge)
+{
+	if (charge)
+	{
+		status.scm = scheme[SchemePowerCharge];
+		return;
+	}
+
+	status.scm = scheme[SchemePowerHigh];
+
+	if (power < PowerThreshMedium)
+		status.scm = scheme[SchemePowerMedium];
+
+	if (power < PowerThreshLow)
+		status.scm = scheme[SchemePowerLow];
+}
+
 void
 updatestatus(void)
 {
-	if (!gettextprop(root, XA_WM_NAME, stext, sizeof(stext)))
-		strcpy(stext, "dwm-"VERSION);
-	drawbar(selmon);
+	if (readfile(&status.power, POWER_FILE))
+		sprintf(status.text, "---");
+	else
+		sprintf(status.text, "%3d", status.power);
+
+	if (readfile(&status.charge, CHARGE_FILE))
+		status.scm = scheme[SchemePowerInval];
+	else
+		statuscolor(status.power, status.charge);
+}
+
+void
+setupstatus()
+{
+	pthread_mutexattr_t attr;
+	pthread_mutex_init(&status.mtx, &attr);
+
+	status.ev.type = ClientMessage;
+	status.ev.xclient.window = root;
+	status.ev.xclient.message_type = statom[StDefault];
+	status.ev.xclient.format = 32;
+
+	updatestatus();
+}
+
+int
+setuphandler(void)
+{
+	sa.sa_flags = SA_SIGINFO;
+	sa.sa_sigaction = timerhandle;
+	sigemptyset(&sa.sa_mask);
+
+	if (sigaction(SIGUSR1, &sa, NULL) == -1)
+		return -errno;
+
+	return 0;
+}
+
+int
+setuptimer(void)
+{
+	sev.sigev_notify = SIGEV_SIGNAL;
+	sev.sigev_signo = SIGUSR1;
+	sev.sigev_value.sival_ptr = &timerid;
+	if (timer_create(CLOCK_REALTIME, &sev, &timerid) == -1)
+		return -errno;
+
+	its.it_value.tv_sec = 1;
+	its.it_value.tv_nsec = 0;
+	its.it_interval.tv_sec = its.it_value.tv_sec;
+	its.it_interval.tv_nsec = its.it_value.tv_nsec;
+
+	if (timer_settime(timerid, 0, &its, NULL) == -1)
+		return -errno;
+
+	return 0;
+}
+
+void
+initstatushandler(void)
+{
+	setupstatus();
+
+	if (setuphandler())
+		return;
+
+	setuptimer();
+}
+
+void
+timerhandle(int sig, siginfo_t *si, void *uc)
+{
+	if (pthread_mutex_lock(&status.mtx))
+		return;
+
+	updatestatus();
+
+	XSendEvent(dpy, root, False, 0xffff, &status.ev);
+	XFlush(dpy);
+
+	pthread_mutex_unlock(&status.mtx);
 }
 
 void
