@@ -117,7 +117,8 @@ struct DevStatus {
 	Clr *scm;
 	int power;
 	int charge;
-	char text[256];
+	char ptext[256];
+	char ttext[256];
 };
 
 typedef struct {
@@ -184,6 +185,8 @@ static void detachstack(Client *c);
 static Monitor *dirtomon(int dir);
 static void drawbar(Monitor *m);
 static void drawbars(void);
+static int drawstatus();
+static void drawtext(const char *text, Clr *scm, int *tw);
 static void enternotify(XEvent *e);
 static void expose(XEvent *e);
 static void focus(Client *c);
@@ -740,14 +743,8 @@ drawbar(Monitor *m)
 	Client *c;
 
 	/* draw status first so it can be overdrawn by tags later */
-	if (m == mons && !pthread_mutex_trylock(&status.mtx)) {
-		drw_setscheme(drw, status.scm);
-
-		tw = TEXTW(status.text) - lrpad + 2; /* 2px right padding */
-		drw_text(drw, mons->ww - tw, 0, tw, bh, 0, status.text, 0);
-
-		pthread_mutex_unlock(&status.mtx);
-	}
+	if (m == mons)
+		tw = drawstatus();
 
 	for (c = m->clients; c; c = c->next) {
 		occ |= c->tags;
@@ -790,6 +787,33 @@ drawbars(void)
 
 	for (m = mons; m; m = m->next)
 		drawbar(m);
+}
+
+void
+drawtext(const char *text, Clr *scm, int *offset)
+{
+	int tw;
+
+	drw_setscheme(drw, scm);
+
+	tw = TEXTW(text) - lrpad + 2; /* 2px right padding */
+	*offset += tw;
+	drw_text(drw, mons->ww - *offset, 0, tw, bh, 0, text, 0);
+}
+
+int
+drawstatus()
+{
+	int tw = 0;
+
+	if (!pthread_mutex_trylock(&status.mtx)) {
+		drawtext(status.ptext, status.scm, &tw);
+		drawtext(status.ttext, scheme[SchemeNorm], &tw);
+
+		pthread_mutex_unlock(&status.mtx);
+	}
+
+	return tw;
 }
 
 void
@@ -2067,15 +2091,23 @@ statuscolor(int power, int charge)
 void
 updatestatus(void)
 {
+	time_t raw;
+	struct tm *ti;
+
 	if (readfile(&status.power, POWER_FILE))
-		sprintf(status.text, "---");
+		sprintf(status.ptext, "---");
 	else
-		sprintf(status.text, "%3d", status.power);
+		sprintf(status.ptext, "%3d", status.power);
 
 	if (readfile(&status.charge, CHARGE_FILE))
 		status.scm = scheme[SchemePowerInval];
 	else
 		statuscolor(status.power, status.charge);
+
+	time(&raw);
+	ti = localtime(&raw);
+
+	sprintf(status.ttext, "%02d:%02d", ti->tm_hour, ti->tm_min);
 }
 
 void
